@@ -1,8 +1,10 @@
 from random import randint
 import sys, traceback, threading, socket
+import time
 
 from VideoStream import VideoStream
 from RtpPacket import RtpPacket
+from NetworkStats import NetworkStats
 
 class ServerWorker:
 	SETUP = 'SETUP'
@@ -19,10 +21,16 @@ class ServerWorker:
 	FILE_NOT_FOUND_404 = 1
 	CON_ERR_500 = 2
 	
+	# HD Video streaming parameters
+	MTU = 1400  # Maximum Transmission Unit (bytes) - safe for most networks
+	MAX_PAYLOAD_SIZE = MTU - 12 - 4  # MTU - RTP_HEADER - FRAGMENT_HEADER
+	
 	clientInfo = {}
 	
 	def __init__(self, clientInfo):
 		self.clientInfo = clientInfo
+		self.stats = NetworkStats()
+		self.fragmentId = 0
 		
 	def run(self):
 		threading.Thread(target=self.recvRtspRequest).start()
@@ -108,7 +116,7 @@ class ServerWorker:
 			self.clientInfo['rtpSocket'].close()
 			
 	def sendRtp(self):
-		"""Send RTP packets over UDP."""
+		"""Send RTP packets over UDP with HD support and fragmentation."""
 		while True:
 			self.clientInfo['event'].wait(0.05) 
 			
@@ -119,32 +127,82 @@ class ServerWorker:
 			data = self.clientInfo['videoStream'].nextFrame()
 			if data: 
 				frameNumber = self.clientInfo['videoStream'].frameNbr()
+				frameSize = len(data)
+				
 				try:
 					address = self.clientInfo['rtspSocket'][1][0]
 					port = int(self.clientInfo['rtpPort'])
-					self.clientInfo['rtpSocket'].sendto(self.makeRtp(data, frameNumber),(address,port))
-				except:
-					print("Connection Error")
-					print('-'*60)
-					traceback.print_exc(file=sys.stdout)
-					print('-'*60)
-
-	def makeRtp(self, payload, frameNbr):
-		"""RTP-packetize the video data."""
+					
+					# Check if frame needs fragmentation
+					if frameSize > self.MAX_PAYLOAD_SIZE:
+						# Fragment the frame
+						self.sendFragmentedFrame(data, frameNumber, address, port)
+					else:
+						# Send as single packet
+						rtpPacket = self.makeRtp(data, frameNumber)
+						self.clientInfo['rtpSocket'].sendto(rtpPacket, (address, port))
+						self.stats.recordPacketSent(len(rtpPacket))
+					
+					self.stats.recordFrameSent()
+					
+					# Print stats every 100 frames
+					if frameNumber % 100 == 0:
+						stats = self.stats.getStats()
+						print(f"[Server] Frame {frameNumber} | Size: {frameSize} bytes | "
+						      f"BW: {stats['bandwidth_sent_kbps']:.0f} Kbps | "
+						      f"Fragments: {stats['fragments_sent']}")
+						
+				except Exception as e:
+					print(f"Connection Error: {e}")
+					#print('-'*60)
+					#traceback.print_exc(file=sys.stdout)
+					#print('-'*60)
+		
+		# Print final statistics when streaming stops
+		print("\n[Server] Streaming stopped. Final statistics:")
+		self.stats.printStats()
+	
+	def makeRtp(self, payload, frameNbr, fragment_id=0, total_fragments=1, fragment_index=0):
+		"""RTP-packetize the video data with optional fragmentation support."""
 		version = 2
 		padding = 0
 		extension = 0
 		cc = 0
-		marker = 0
+		marker = 1 if (fragment_index == total_fragments - 1) else 0  # Set marker on last fragment
 		pt = 26 # MJPEG type
 		seqnum = frameNbr
 		ssrc = 0 
 		
 		rtpPacket = RtpPacket()
 		
-		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)
+		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload, 
+		                 fragment_id, total_fragments, fragment_index)
 		
 		return rtpPacket.getPacket()
+	
+	def sendFragmentedFrame(self, data, frameNumber, address, port):
+		"""Fragment and send a large frame."""
+		# Calculate number of fragments needed
+		totalFragments = (len(data) + self.MAX_PAYLOAD_SIZE - 1) // self.MAX_PAYLOAD_SIZE
+		self.fragmentId += 1
+		
+		print(f"[Server] Fragmenting frame {frameNumber}: {len(data)} bytes into {totalFragments} fragments")
+		
+		# Send each fragment
+		for i in range(totalFragments):
+			start = i * self.MAX_PAYLOAD_SIZE
+			end = min(start + self.MAX_PAYLOAD_SIZE, len(data))
+			fragmentData = data[start:end]
+			
+			# Create RTP packet with fragment information
+			rtpPacket = self.makeRtp(fragmentData, frameNumber, self.fragmentId, totalFragments, i)
+			self.clientInfo['rtpSocket'].sendto(rtpPacket, (address, port))
+			
+			self.stats.recordPacketSent(len(rtpPacket))
+			self.stats.recordFragmentSent()
+			
+			# Small delay between fragments to avoid overwhelming the network
+			time.sleep(0.001)  # 1ms delay between fragments
 		
 	def replyRtsp(self, code, seq):
 		"""Send RTSP reply to the client."""
